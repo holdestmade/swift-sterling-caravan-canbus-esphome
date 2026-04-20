@@ -26,7 +26,7 @@ Modern Swift/Sterling caravans use a CAN bus network to connect the control pane
 - Floor and pelmet LED strips (PWM via LEDC, 10 kHz)
 - Feedback-loop prevention so local panel and Home Assistant stay in sync
 
-### Heating (Alde)
+### Heating (Alde) - CURRENTLY READ ONLY
 - Thermostat entity with Heat / Off modes
 - Default preset 19 °C, storage preset 10 °C, range 4–30 °C
 - Heating mode read-out: Off / Electric 1 kW / 2 kW / 3 kW / Gas
@@ -94,8 +94,8 @@ Modern Swift/Sterling caravans use a CAN bus network to connect the control pane
 All entities are exposed over the encrypted ESPHome API. Once adopted in Home Assistant you get:
 
 - Light entities for every lighting circuit (with dimmer support)
-- Climate entity for the Alde heating system
-- Select entities for heating and hot water mode read-outs
+- Climate entity for the Alde heating system (READ ONLY)
+- Select entities for heating and hot water mode read-outs (READ ONLY)
 - Sensor entities for every voltage, current, power, temperature, and status value
 - Binary sensor entities for all warning and status flags
 
@@ -111,22 +111,6 @@ wifi_password: "YourPassword"
 api_encryption_key: "your-32-byte-base64-key"
 ```
 
-Generate an API encryption key with:
-
-```bash
-esphome generate-encryption-key
-```
-
-## Building & Flashing
-
-1. Install [ESPHome](https://esphome.io/guides/getting_started_command_line).
-2. Create your `secrets.yaml` alongside `esphome.yaml`.
-3. Flash via USB for the first time:
-   ```bash
-   esphome run esphome.yaml
-   ```
-4. Subsequent updates can be pushed OTA from the ESPHome dashboard or CLI.
-
 ## Wiring Notes
 
 - Connect the SN65HVD230 CANH/CANL lines in parallel with the existing caravan CAN bus — do **not** break the bus.
@@ -135,4 +119,4 @@ esphome generate-encryption-key
 
 ## Compatibility
 
-Tested on Swift/Sterling caravans that use the Al-Ko / Alde / Truma integrated CAN bus system. The CAN frame IDs and byte layouts are specific to this manufacturer's implementation and may not match other brands.
+Tested on Swift/Sterling caravans that use the Al-Ko / Alde / Sargent integrated CAN bus system. The CAN frame IDs and byte layouts are specific to this manufacturer's implementation and may not match other brands.
