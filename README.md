@@ -1,8 +1,9 @@
 # Swift/Sterling Caravan CANBUS ESPHome Interface
 
+An ESPHome configuration that bridges a Swift or Sterling caravan's internal CAN bus network to Wi-Fi, exposing full monitoring and control through Home Assistant.
+
 > **Disclaimer:** This is an independent, community-developed project and is not affiliated with, endorsed by, or supported by Sargent Electrical Services, Swift Group, Sterling Caravans, Alde, Al-Ko, or any other manufacturer or brand mentioned herein. All trademarks and brand names remain the property of their respective owners. Use this project at your own risk — modifications to your caravan's electrical or CAN bus systems may affect safety, void warranties, and are entirely your own responsibility.
 
-An ESPHome configuration that bridges a Swift or Sterling caravan's internal CAN bus network to Wi-Fi, exposing full monitoring and control through Home Assistant.
 
 ## Overview
 
