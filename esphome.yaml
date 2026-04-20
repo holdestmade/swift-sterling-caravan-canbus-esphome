@@ -1,0 +1,1223 @@
+esphome:
+  name: caravan-canbus-to-wifi
+  friendly_name: Caravan Canbus to WIFI
+  comment: ESP32 and SN65HVD230 CAN Interface
+  on_boot:
+    priority: -90
+    then:
+      - wait_until:
+          condition:
+            lambda: 'return id(sel_heating_mode).has_state();'
+          timeout: 5s
+      - lambda: |-
+          if (!id(sel_heating_mode).has_state()) {
+            ESP_LOGW("BOOT", "Heating mode not received from CAN within 5s — climate state may be stale");
+            return;
+          }
+          if (id(sel_heating_mode).current_option() != "Off") {
+            auto call = id(caravan_climate).make_call();
+            call.set_mode(climate::CLIMATE_MODE_HEAT);
+            call.perform();
+          } else {
+            auto call = id(caravan_climate).make_call();
+            call.set_mode(climate::CLIMATE_MODE_OFF);
+            call.perform();
+          }
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP_PHY_REDUCE_TX_POWER: "y"
+    advanced:
+      minimum_chip_revision: '3.1'
+
+wifi:
+  networks:
+    - ssid: !secret ssid
+      password: !secret wifi_password
+  ap:
+    ssid: ESPHome AP
+    password: !secret wifi_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret esphome_key
+
+ota:
+  - platform: esphome
+
+button:
+  - platform: restart
+    name: Restart
+
+logger:
+  level: WARN
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          const bool online = (millis() - id(g_can_last_ms)) < 5000;
+          if (!id(bs_can_online).has_state() || id(bs_can_online).state != online) {
+            id(bs_can_online).publish_state(online);
+          }
+
+globals:
+  - id: g_d1_on
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: g_d2_on
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: g_d1_level
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: g_d2_level
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: power_state 
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: g_032_b0
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_032_b1
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_032_b2
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_032_b3
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_032_b4
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_032_b5
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_032_b6
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_032_b7
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: g_entry_sync
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: g_entry_on
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: g_interior_sync
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: g_awning_sync
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: g_dim1_sync
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: g_dim2_sync
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: g_can_last_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: g_heat_mode_idx
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: g_hot_water_mode_idx
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: g_can_frame_counter
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: g_atc_last_sig
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+
+canbus:
+  - platform: esp32_can
+    id: caravan_can
+    rx_pin: GPIO4
+    tx_pin: GPIO5
+    bit_rate: 125kbps
+    can_id: 0x000
+    use_extended_id: false
+
+    on_frame:
+      - can_id: 0x000
+        can_id_mask: 0x000
+        then:
+          - lambda: |-
+              id(g_can_last_ms) = millis();
+              id(g_can_frame_counter)++;
+
+              if (!id(interior_lights).current_values.is_on()) {
+                id(g_interior_sync) = true;
+                auto call = id(interior_lights).turn_on();
+                call.set_transition_length(0);
+                call.perform();
+                id(g_interior_sync) = false;
+              }
+
+      # - can_id: 0x08F
+      #   can_id_mask: 0x7FF
+      #   then:
+      #     - lambda: |-
+      #         ESP_LOGI("CANDBG", "[%u] %s",
+      #                 (unsigned) x.size(),
+      #                 format_hex_pretty(x.data(), x.size()).c_str());
+
+      # Alko ATC CAN Block
+      - can_id: 0x0D8
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.size() < 8) return;
+              uint64_t frame = 0;
+              for (int i = 0; i < 8; i++) frame |= ((uint64_t)x[i]) << (i * 8);
+
+              if (frame != id(g_atc_last_sig)) {
+                id(g_atc_last_sig) = frame;
+                std::string hex = format_hex_pretty(x.data(), x.size());
+                id(ts_alko_atc_last_data).publish_state(hex);
+              }
+
+              const uint64_t status_not_known       = 0x0000000000000000ULL;
+              const uint64_t waiting_for_self_test  = 0x0000000000008406ULL;
+              const uint64_t self_test_active_1     = 0x0000000000007606ULL;
+              const uint64_t self_test_active_2     = 0x0000000000008006ULL;
+              const uint64_t self_test_active_3     = 0x0000000000008301ULL;
+              const uint64_t active                 = 0x0000000000008401ULL;
+              const uint64_t in_action              = 0x0000000000009999ULL;
+
+              const char *state = "Unknown";
+              if (frame == status_not_known) state = "Status not Known";
+              else if (frame == waiting_for_self_test) state = "Waiting for Self Test";
+              else if (frame == self_test_active_1 || frame == self_test_active_2 || frame == self_test_active_3) state = "Self Test Active";
+              else if (frame == active) state = "Active";
+              else if (frame == in_action) state = "In Action";
+
+              if (!id(ts_alko_atc_status).has_state() || id(ts_alko_atc_status).state != state) {
+                id(ts_alko_atc_status).publish_state(state);
+                ESP_LOGD("ATC", "Alko ATC: %s", state);
+              }
+
+      - can_id: 0x032
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.size() < 8) {
+                ESP_LOGD("CAN032", "short frame (%u)", (unsigned)x.size());
+                return;
+              }
+
+              id(g_032_b0)=x[0]; id(g_032_b1)=x[1]; id(g_032_b2)=x[2]; id(g_032_b3)=x[3];
+              id(g_032_b4)=x[4]; id(g_032_b5)=x[5]; id(g_032_b6)=x[6]; id(g_032_b7)=x[7];
+
+              const bool pump = x[0] > 0;
+              if (!id(bs_pump).has_state() || id(bs_pump).state != pump) {
+                id(bs_pump).publish_state(pump);
+              }
+
+              const char* batt = x[1] ? "Car" : "Leisure";
+              if (!id(ts_selected_battery).has_state() || id(ts_selected_battery).state != batt) {
+                id(ts_selected_battery).publish_state(batt);
+              }
+
+              const bool eng = x[5] > 0;
+              if (!id(bs_car_engine).has_state() || id(bs_car_engine).state != eng) {
+                id(bs_car_engine).publish_state(eng);
+              }
+
+              const bool mains = x[6] > 0;
+              if (!id(bs_mains).has_state() || id(bs_mains).state != mains) {
+                id(bs_mains).publish_state(mains);
+              }
+
+              const bool pwr = x[7] > 0;
+              if (id(power_state) != pwr) {
+                id(power_state) = pwr;
+                id(bs_power).publish_state(pwr);
+              }
+
+              static bool last_interior = false;
+              const bool interior_on = x[2] > 0;
+              if (interior_on != last_interior) {
+                last_interior = interior_on;
+                id(g_interior_sync) = true;
+                auto call = interior_on ? id(interior_lights).turn_on() : id(interior_lights).turn_off();
+                call.set_transition_length(0);
+                call.perform();
+                id(g_interior_sync) = false;
+              }
+
+              static bool last_awn = false;
+              const bool awn_on = x[3] > 0;
+              if (awn_on != last_awn) {
+                last_awn = awn_on;
+                id(g_awning_sync) = true;
+                auto call = awn_on
+                  ? id(awning_light).turn_on()
+                  : id(awning_light).turn_off();
+                call.set_transition_length(0);
+                call.perform();
+                id(g_awning_sync) = false;
+              }
+
+      - can_id: 0x033
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.size() >= 8) {
+                const bool d1_on  = x[0] > 0;
+                const bool d2_on  = x[1] > 0;
+                const float d1_lv = x[2] / 100.0f;
+                const float d2_lv = x[3] / 100.0f;
+
+                id(g_d1_on) = d1_on; id(g_d1_level) = d1_lv;
+                id(g_d2_on) = d2_on; id(g_d2_level) = d2_lv;
+
+                static bool last_d1 = false;
+                if (d1_on != last_d1) {
+                  last_d1 = d1_on;
+                  id(g_dim1_sync) = true;
+                  auto c1 = d1_on ? id(dimmer1_light).turn_on() : id(dimmer1_light).turn_off();
+                  c1.set_transition_length(0);
+                  c1.perform();
+                  id(g_dim1_sync) = false;
+                }
+
+                static bool last_d2 = false;
+                if (d2_on != last_d2) {
+                  last_d2 = d2_on;
+                  id(g_dim2_sync) = true;
+                  auto c2 = d2_on ? id(dimmer2_light).turn_on() : id(dimmer2_light).turn_off();
+                  c2.set_transition_length(0);
+                  c2.perform();
+                  id(g_dim2_sync) = false;
+                }
+
+                const char* solar_src = x[6] ? "Car" : "Leisure";
+                if (!id(ts_solar_charging_source).has_state() || id(ts_solar_charging_source).state != solar_src)
+                  id(ts_solar_charging_source).publish_state(solar_src);
+
+                const bool solar_chg = x[7] > 0;
+                if (!id(bs_solar_charging).has_state() || id(bs_solar_charging).state != solar_chg)
+                  id(bs_solar_charging).publish_state(solar_chg);
+              } else {
+                ESP_LOGD("CAN033", "short frame (%u)", (unsigned)x.size());
+              }
+
+      - can_id: 0x05A
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.size() >= 8) {
+                auto pub_bin = [](esphome::template_::TemplateBinarySensor* s, bool v) {
+                  if (!s->has_state() || s->state != v) s->publish_state(v);
+                };
+                pub_bin(id(bs_frost_warning),            x[0] > 0);
+                pub_bin(id(bs_vehicle_voltage_warning),  x[1] > 0);
+                pub_bin(id(bs_leisure_voltage_warning),  x[2] > 0);
+                pub_bin(id(bs_mains_warning),            x[6] > 0);
+                pub_bin(id(bs_ac_overcurrent_warning),   x[7] > 0);
+              } else {
+                ESP_LOGD("CAN05A", "short frame (%u)", (unsigned)x.size());
+              }
+
+      - can_id: 0x05B
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.size() >= 8) {
+                auto pub_txt = [](esphome::template_::TemplateTextSensor* s, const std::string &v) {
+                  if (!s->has_state() || s->state != v) s->publish_state(v);
+                };
+                pub_txt(id(ts_cp_software_version),      to_string((int)x[0]));
+                pub_txt(id(ts_ec630_software_version),    to_string((int)x[1]));
+                {
+                  const float temp = (float)x[4];
+                  if (!id(heating_set_temperature).has_state() ||
+                      (int)id(heating_set_temperature).state != (int)temp) {
+                    id(heating_set_temperature).publish_state(temp);
+                  }
+                }
+
+                {
+                  const uint8_t hw = x[5];
+                  if (id(g_hot_water_mode_idx) != hw && hw <= 2) {
+                    id(g_hot_water_mode_idx) = hw;
+                    static const char* opts[] = {"Off","Normal","Boost"};
+                    id(sel_hot_water_mode).publish_state(opts[hw]);
+                  }
+                }
+                id(bs_heating_error).publish_state(x[6] > 0);
+                id(bs_hot_water_error).publish_state(x[7] > 0);
+              } else {
+                ESP_LOGD("CAN05B", "short frame (%u)", (unsigned)x.size());
+              }
+
+      - can_id: 0x083
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.size() >= 6) {
+                uint16_t raw_ext = (uint16_t(x[3]) << 8) | x[2];
+                uint16_t raw_int = (uint16_t(x[5]) << 8) | x[4];
+
+                const float K_OFFSET = 273.15f;
+                const float t_ext = (raw_ext / 10.0f) - K_OFFSET;
+                const float t_int = (raw_int / 10.0f) - K_OFFSET;
+
+                ESP_LOGD("CAN083",
+                         "RAW83: [%u] %s -> raw_ext=%u raw_int=%u t_ext=%.2f t_int=%.2f",
+                         (unsigned)x.size(),
+                         format_hex_pretty(x.data(), x.size()).c_str(),
+                         raw_ext, raw_int, t_ext, t_int);
+
+                auto pub_num = [](esphome::template_::TemplateSensor* s, float v) {
+                  if (!s->has_state() || fabsf(s->state - v) >= 0.1f)
+                    s->publish_state(roundf(v * 10.0f) / 10.0f);
+                };
+                pub_num(id(temp_external), t_ext);
+                pub_num(id(temp_internal), t_int);
+              }
+
+              if (x.size() >= 7) {
+                const std::string v = to_string((int)x[6]);
+                if (!id(ts_psu_software_number).has_state() || id(ts_psu_software_number).state != v)
+                  id(ts_psu_software_number).publish_state(v);
+              }
+
+      - can_id: 0x084
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.size() >= 8) {
+                auto pub_num = [](esphome::template_::TemplateSensor* s, float v, float eps=0.01f) {
+                  if (!s->has_state() || isnan(s->state) || fabsf(s->state - v) >= eps) s->publish_state(v);
+                };
+                pub_num(id(vehicle_batt_voltage), x[0] / 10.0f, 0.05f);
+                pub_num(id(leisure_batt_voltage), x[1] / 10.0f, 0.05f);
+
+                const float raw_current = x[2] / 10.0f;
+                const float sign = x[3] ? 1.0f : -1.0f;
+                pub_num(id(leisure_batt_current), raw_current * sign, 0.05f);
+                id(ts_leisure_batt_status).publish_state(x[3] ? "Charge" : "Discharge");
+
+                pub_num(id(solar_current),        x[4] / 10.0f, 0.05f);
+                pub_num(id(ac_current),           x[5] / 10.0f, 0.05f);
+
+                const int hum = (int)x[6];
+                if (!id(internal_humidity).has_state() || (int)id(internal_humidity).state != hum)
+                  id(internal_humidity).publish_state(hum);
+
+                const bool entry_on = x[7] > 0;
+                if (id(g_entry_on) != entry_on) {
+                  id(g_entry_on) = entry_on;
+                  id(g_entry_sync) = true;
+                  auto c = entry_on ? id(entry_light).turn_on() : id(entry_light).turn_off();
+                  c.set_transition_length(0);
+                  c.perform();
+                  id(g_entry_sync) = false;
+                }
+              } else {
+                ESP_LOGD("CAN084", "short frame (%u)", (unsigned)x.size());
+              }
+
+      - can_id: 0x085
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.size() >= 2) {
+                uint8_t new_idx = 0;
+                const bool gas_on = x[1] > 0;
+                if (gas_on) {
+                  new_idx = 4;  // Gas
+                } else {
+                  switch (x[0]) {            // first byte
+                    case 1: new_idx = 1; break;  // Electric 1kW
+                    case 2: new_idx = 2; break;  // Electric 2kW
+                    case 3: new_idx = 3; break;  // Electric 3kW
+                    default: new_idx = 0; break; // Off
+                  }
+                }
+                if (id(g_heat_mode_idx) != new_idx) {
+                  id(g_heat_mode_idx) = new_idx;
+                  static const char* opts[] = {"Off","Electric 1kW","Electric 2kW","Electric 3kW","Gas"};
+                  id(sel_heating_mode).publish_state(opts[new_idx]);
+                }
+              } else {
+                ESP_LOGD("CAN085", "short frame (%u)", (unsigned)x.size());
+              }
+
+      - can_id: 0x086
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.size() < 8) return;
+              const uint8_t to_sel = x[4];
+              const char* to_text = "Unknown";
+              switch (to_sel) {
+                case 0x00: to_text = "Off"; break;
+                case 0x01: to_text = "Leisure"; break;
+                case 0x02: to_text = "Vehicle"; break;
+                default:   to_text = "Unknown"; break;
+              }
+              if (!id(ts_solar_charge_to).has_state() || id(ts_solar_charge_to).state != to_text) {
+                id(ts_solar_charge_to).publish_state(to_text);
+              }
+              const uint8_t mode_sel = x[5];
+              const char* mode_text = "Unknown";
+              switch (mode_sel) {
+                case 0x00: mode_text = "Smart"; break;
+                case 0x01: mode_text = "Normal"; break;
+                case 0x02: mode_text = "Smart 2"; break;
+                case 0x03: mode_text = "Smart 3"; break;
+                default:   mode_text = "Unknown"; break;
+              }
+              if (!id(ts_charging_mode).has_state() || id(ts_charging_mode).state != mode_text) {
+                id(ts_charging_mode).publish_state(mode_text);
+              }
+
+      - can_id: 0x087
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.size() >= 7) {
+                const bool timer = x[6] > 0;
+                const std::string mode = timer ? "Timer" : "Manual";
+                if (!id(ts_heating_control_mode).has_state() || id(ts_heating_control_mode).state != mode) {
+                  id(ts_heating_control_mode).publish_state(mode);
+                }
+              } else {
+                ESP_LOGD("CAN087", "short frame (%u)", (unsigned)x.size());
+              }
+
+binary_sensor:
+  - platform: status
+    name: ESP Status
+
+  - platform: template
+    id: bs_pump
+    name: "Pump"
+    icon: mdi:water-pump
+    
+  - platform: template
+    id: bs_power
+    name: "Power"
+    icon: mdi:power
+    device_class: power
+
+  - platform: template
+    id: bs_car_engine
+    name: "Car Engine"
+    icon: mdi:engine
+    device_class: running
+
+  - platform: template
+    id: bs_mains
+    name: "Mains Connected"
+    device_class: plug
+    icon: mdi:power-socket-uk
+
+  - platform: template
+    id: bs_solar_charging
+    name: "Solar Charging"
+    device_class: battery_charging
+
+  - platform: template
+    id: bs_frost_warning
+    name: "Frost Warning"
+    icon: mdi:snowflake-alert
+    device_class: cold
+    entity_category: diagnostic
+
+  - platform: template
+    id: bs_vehicle_voltage_warning
+    name: "Vehicle Voltage Warning"
+    icon: mdi:car-battery
+    entity_category: diagnostic
+
+  - platform: template
+    id: bs_leisure_voltage_warning
+    name: "Leisure Voltage Warning"
+    icon: mdi:car-battery
+    entity_category: diagnostic
+
+  - platform: template
+    id: bs_mains_warning
+    name: "Mains Warning"
+    icon: mdi:power-socket-uk
+    entity_category: diagnostic
+
+  - platform: template
+    id: bs_ac_overcurrent_warning
+    name: "Mains Over Current Warning"
+    icon: mdi:current-ac
+    entity_category: diagnostic
+
+  - platform: template
+    id: bs_heating_error
+    name: "Heating Error"
+    icon: mdi:heating-coil
+    entity_category: diagnostic
+
+  - platform: template
+    id: bs_hot_water_error
+    name: "Hot Water Error"
+    icon: mdi:water-boiler
+    entity_category: diagnostic
+
+  - platform: template
+    id: bs_can_online
+    name: "CAN Online"
+    device_class: connectivity
+    icon: mdi:car-connected
+    entity_category: diagnostic
+
+  - platform: template
+    id: bs_heating_on
+    name: "Heating"
+    icon: mdi:radiator
+    lambda: |-
+      return id(sel_heating_mode).current_option() != "Off";
+    on_press:
+      then:
+        - climate.control:
+            id: caravan_climate
+            mode: HEAT
+    on_release:
+      then:
+        - climate.control:
+            id: caravan_climate
+            mode: "OFF"
+
+  - platform: template
+    id: bs_hot_water_on
+    name: "Hot Water"
+    icon: mdi:water-boiler
+    lambda: |-
+      return id(sel_hot_water_mode).current_option() != "Off";
+      
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP
+    ssid:
+      name: SSID
+    mac_address:
+      name: MAC
+
+  - platform: template
+    id: ts_selected_battery
+    name: "Selected Battery"
+    icon: mdi:car-battery
+    update_interval: never
+
+  - platform: template
+    id: ts_solar_charging_source
+    name: "Solar Charging Source"
+    icon: mdi:solar-power-variant
+    update_interval: never
+
+  - platform: template
+    id: ts_cp_software_version
+    name: "Control Panel Software Version"
+    icon: mdi:alarm-panel
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: ts_ec630_software_version
+    name: "EC630 Software Version"
+    icon: mdi:cpu-32-bit
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: ts_psu_software_number
+    name: "PSU Software Number"
+    icon: mdi:cpu-32-bit
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: ts_leisure_batt_status
+    name: "Leisure Battery Status"
+    icon: mdi:car-battery
+    update_interval: never
+
+  - platform: template
+    id: ts_heating_control_mode
+    name: "Heating Control Mode"
+    icon: mdi:timer-cog
+    update_interval: never
+
+  - platform: template
+    id: ts_alko_atc_status
+    name: "Alko ATC Status"
+    icon: mdi:car-traction-control
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: ts_alko_atc_last_data
+    name: "Alko ATC Last Data"
+    icon: mdi:clipboard-text-clock
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: ts_solar_charge_to
+    name: "Solar Charge to"
+    icon: mdi:solar-power-variant
+    update_interval: never
+
+  - platform: template
+    id: ts_charging_mode
+    name: "Charging Mode"
+    icon: mdi:car-battery
+    update_interval: never
+
+sensor:
+  - platform: wifi_signal
+    name: WiFi Signal
+
+  - platform: template
+    id: heating_set_temperature
+    name: "Heating Set Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 1s
+      - delta: 0.1
+    on_value:
+      then:
+        - climate.control:
+            id: caravan_climate
+            target_temperature: !lambda |-
+              return x;
+
+  - platform: template
+    id: leisure_battery_power
+    name: "Leisure Battery Power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      const float v = id(leisure_batt_voltage).state;
+      const float i = id(leisure_batt_current).state;
+      if (isnan(v) || isnan(i)) return NAN;
+      return roundf(v * i);
+
+  - platform: template
+    id: solar_power
+    name: "Solar Power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      const float v = id(leisure_batt_voltage).state;
+      const float i = id(solar_current).state;
+      if (isnan(v) || isnan(i)) return NAN;
+      return roundf(v * i);
+
+  - platform: template
+    id: mains_power
+    name: "Mains Power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      const float v = 240.0;
+      const float I = id(ac_current).state;  // A
+      if (isnan(I)) return NAN;
+      return roundf(v * I);
+
+  - platform: template
+    id: temp_internal
+    name: "Internal Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.1
+
+  - platform: template
+    id: temp_external
+    name: "External Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.1
+
+  - platform: template
+    id: vehicle_batt_voltage
+    name: "Vehicle Battery Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.1
+
+  - platform: template
+    id: leisure_batt_voltage
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.1
+
+  - platform: template
+    name: "Leisure Battery Voltage"
+    id: lb_voltage_avg
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    icon: mdi:car-battery
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      static float ema = NAN;
+      const float raw = id(leisure_batt_voltage).state;
+      if (isnan(raw)) return NAN;
+      if (isnan(ema)) ema = raw;
+      else ema = 0.2f * raw + 0.8f * ema;
+      return ema;
+
+  - platform: template
+    id: leisure_batt_current
+    name: "Leisure Battery Current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.1
+
+  - platform: template
+    id: solar_current
+    name: "Solar Current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.1
+
+  - platform: template
+    id: ac_current
+    name: "Mains Current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.1
+
+  - platform: template
+    id: internal_humidity
+    name: "Internal Humidity"
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.5
+
+  - platform: template
+    id: canbus_rate
+    name: "Canbus Rate"
+    unit_of_measurement: "msg/s"
+    accuracy_decimals: 0
+    update_interval: 1s
+    entity_category: diagnostic
+    lambda: |-
+      static uint32_t last_count = 0;
+      uint32_t current = id(g_can_frame_counter);
+      uint32_t diff = current - last_count;
+      last_count = current;
+      return diff;
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+
+output:
+  - platform: template
+    id: dimmer1_tx_out
+    type: float
+    write_action:
+      - if:
+          condition:
+            lambda: |-
+              if (id(g_dim1_sync)) return false;
+              const uint8_t d1_new = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, state * 100.0f)));
+              const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+              return d1_new != d1_cur;
+          then:
+            - canbus.send:
+                can_id: 0x00B
+                use_extended_id: false
+                data: !lambda |-
+                  const uint8_t d1 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, state * 100.0f)));
+                  const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+                  return std::vector<uint8_t>{1, 150, d1, d2_cur, 4, 0, 0, 0};
+
+  - platform: template
+    id: dimmer2_tx_out
+    type: float
+    write_action:
+      - if:
+          condition:
+            lambda: |-
+              if (id(g_dim2_sync)) return false;
+              const uint8_t d2_new = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, state * 100.0f)));
+              const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+              return d2_new != d2_cur;
+          then:
+            - canbus.send:
+                can_id: 0x00B
+                use_extended_id: false
+                data: !lambda |-
+                  const uint8_t d2 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, state * 100.0f)));
+                  const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+                  return std::vector<uint8_t>{1, 150, d1_cur, d2, 4, 0, 0, 0};
+
+  - platform: template
+    id: interior_lights_tx_out
+    type: binary
+    write_action:
+      - if:
+          condition:
+            lambda: |-
+              const bool syncing = id(g_interior_sync); 
+              const bool want_on = state;
+              const bool is_on   = id(g_032_b2) > 0;
+              return (!syncing) && (want_on != is_on);
+          then:
+            - canbus.send:
+                can_id: 0x00B
+                use_extended_id: false
+                data: !lambda |-
+                  const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+                  const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+                  return std::vector<uint8_t>{5, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+
+  - platform: template
+    id: awning_light_tx_out
+    type: binary
+    write_action:
+      - if:
+          condition:
+            lambda: |-
+              const bool syncing = id(g_awning_sync);
+              const bool want_on = state;
+              const bool is_on   = id(g_032_b3) > 0;
+              return (!syncing) && (want_on != is_on);
+          then:
+            - canbus.send:
+                can_id: 0x00B
+                use_extended_id: false
+                data: !lambda |-
+                  const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+                  const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+                  return std::vector<uint8_t>{6, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+
+  - platform: template
+    id: entry_light_tx_out
+    type: binary
+    write_action:
+      - if:
+          condition:
+            lambda: |-
+              const bool syncing = id(g_entry_sync);
+              const bool want_on = state;
+              const bool is_on   = id(g_entry_on);
+              return (!syncing) && (want_on != is_on);
+          then:
+            - canbus.send:
+                can_id: 0x00B
+                use_extended_id: false
+                data: !lambda |-
+                  const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+                  const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+                  return std::vector<uint8_t>{8, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+
+  - platform: ledc
+    pin: 16
+    inverted: false
+    max_power: 0.5
+    id: floor_lights_output
+    frequency: 10000 Hz
+
+  - platform: ledc
+    pin: 17
+    inverted: false
+    max_power: 0.5
+    id: pelmet_lights_output
+    frequency: 10000 Hz
+
+light:
+  - platform: monochromatic
+    gamma_correct: 1.0
+    id: dimmer1_light
+    name: "Bedroom Light"
+    icon: mdi:wall-sconce-flat-variant-outline
+    output: dimmer1_tx_out
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - lambda: |-
+          id(g_dim1_sync) = true;
+      - if:
+          condition:
+            lambda: |-
+              return !id(g_d1_on);
+          then:
+            - canbus.send:
+                can_id: 0x00B
+                use_extended_id: false
+                data: !lambda |-
+                  const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+                  const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+                  return std::vector<uint8_t>{9, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+      - lambda: |-
+          id(g_dim1_sync) = false;
+    on_turn_off:
+      - lambda: |-
+          id(g_dim1_sync) = true;
+      - if:
+          condition:
+            lambda: |-
+              return id(g_d1_on);
+          then:
+            - canbus.send:
+                can_id: 0x00B
+                use_extended_id: false
+                data: !lambda |-
+                  const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+                  const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+                  return std::vector<uint8_t>{9, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+      - lambda: |-
+          id(g_dim1_sync) = false;
+
+  - platform: monochromatic
+    id: dimmer2_light
+    name: "Living Area Light"
+    output: dimmer2_tx_out
+    gamma_correct: 1.0
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - lambda: |-
+          id(g_dim2_sync) = true;
+      - if:
+          condition:
+            lambda: |-
+              return !id(g_d2_on);
+          then:
+            - canbus.send:
+                can_id: 0x00B
+                use_extended_id: false
+                data: !lambda |-
+                  const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+                  const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+                  return std::vector<uint8_t>{10, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+
+      - lambda: |-
+          id(g_dim2_sync) = false;
+    on_turn_off:
+      - lambda: |-
+          id(g_dim2_sync) = true;
+      - if:
+          condition:
+            lambda: |-
+              return id(g_d2_on);
+          then:
+            - canbus.send:
+                can_id: 0x00B
+                use_extended_id: false
+                data: !lambda |-
+                  const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+                  const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+                  return std::vector<uint8_t>{10, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+      - lambda: |-
+          id(g_dim2_sync) = false;
+
+  - platform: binary
+    name: "Interior Lights"
+    icon: mdi:lightbulb
+    id: interior_lights
+    output: interior_lights_tx_out
+    restore_mode: ALWAYS_OFF
+
+  - platform: binary
+    name: "Awning Light"
+    icon: mdi:wall-sconce-flat
+    id: awning_light
+    output: awning_light_tx_out
+    restore_mode: RESTORE_DEFAULT_OFF 
+
+  - platform: binary
+    name: "Entry Light"
+    icon: mdi:lightbulb
+    id: entry_light
+    output: entry_light_tx_out
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: monochromatic
+    name: "Floor Lights"
+    icon: mdi:lightbulb
+    id: floor_lights
+    output: floor_lights_output
+    gamma_correct: 1.0  
+    restore_mode: RESTORE_DEFAULT_OFF 
+
+  - platform: monochromatic
+    name: "Pelmet Lights"
+    icon: mdi:lightbulb
+    id: pelmet_lights
+    output: pelmet_lights_output
+    gamma_correct: 1.0  
+    restore_mode: RESTORE_DEFAULT_OFF 
+
+select:
+  - platform: template
+    id: sel_heating_mode
+    name: "Heating Mode"
+    icon: mdi:radiator
+    options:
+      - "Off"
+      - "Electric 1kW"
+      - "Electric 2kW"
+      - "Electric 3kW"
+      - "Gas"
+    lambda: |-
+      static const char* opts[] = {"Off","Electric 1kW","Electric 2kW","Electric 3kW","Gas"};
+      return std::string(opts[id(g_heat_mode_idx)]);
+    set_action:
+      - lambda: |-
+          static const char* opts[] = {"Off","Electric 1kW","Electric 2kW","Electric 3kW","Gas"};
+          ESP_LOGI("HEAT", "Heating Mode is read-only; ignoring user change to: %s", x.c_str());
+          id(sel_heating_mode).publish_state(opts[id(g_heat_mode_idx)]);
+
+  - platform: template
+    id: sel_hot_water_mode
+    name: "Hot Water Mode"
+    icon: mdi:water-boiler
+    options:
+      - "Off"
+      - "Normal"
+      - "Boost"
+    lambda: |-
+      static const char* opts[] = {"Off","Normal","Boost"};
+      return std::string(opts[id(g_hot_water_mode_idx)]);
+    set_action:
+      - lambda: |-
+          static const char* opts[] = {"Off","Normal","Boost"};
+          ESP_LOGI("HW", "Hot Water Mode is read-only; ignoring user change to: %s", x.c_str());
+          id(sel_hot_water_mode).publish_state(opts[id(g_hot_water_mode_idx)]);
+
+climate:
+  - platform: thermostat
+    id: caravan_climate
+    name: "Alde Heating"
+    sensor: temp_internal
+    min_idle_time: 1s
+    min_heating_off_time: 1s
+    min_heating_run_time: 1s
+    idle_action:
+      - logger.log: "Climate idle (read-only)"
+    heat_action:
+      - logger.log: "Climate heat (read-only)"
+    preset:
+      - name: "Default"
+        default_target_temperature_low: 19 °C
+      - name: "Storage"
+        default_target_temperature_low: 10 °C
+    default_preset: "Default"
+    visual:
+      min_temperature: 4 °C
+      max_temperature: 30 °C
+      temperature_step:
+        target_temperature: 1.0
+        current_temperature: 0.1
