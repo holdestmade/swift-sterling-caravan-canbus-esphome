@@ -216,7 +216,6 @@ canbus:
       #                 (unsigned) x.size(),
       #                 format_hex_pretty(x.data(), x.size()).c_str());
 
-      # Alko ATC CAN Block
       - can_id: 0x0D8
         can_id_mask: 0x7FF
         then:
@@ -238,7 +237,6 @@ canbus:
               const uint64_t self_test_active_3     = 0x0000000000008301ULL;
               const uint64_t active                 = 0x0000000000008401ULL;
               const uint64_t in_action              = 0x0000000000009999ULL;
-
               const char *state = "Unknown";
               if (frame == status_not_known) state = "Status not Known";
               else if (frame == waiting_for_self_test) state = "Waiting for Self Test";
