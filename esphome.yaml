@@ -14,7 +14,9 @@ esphome:
             ESP_LOGW("BOOT", "Heating mode not received from CAN within 5s — climate state may be stale");
             return;
           }
-          if (id(sel_heating_mode).current_option() != "Off") {
+          // Consider heating "on" if any electric level is selected OR gas is lit.
+          const bool any_heat = (id(sel_heating_mode).current_option() != "Off") || id(g_gas_on);
+          if (any_heat) {
             auto call = id(caravan_climate).make_call();
             call.set_mode(climate::CLIMATE_MODE_HEAT);
             call.perform();
@@ -34,11 +36,11 @@ esp32:
 
 wifi:
   networks:
-    - ssid: !secret ssid
-      password: !secret wifi_password
+    - ssid: "GL-X3000-673"
+      password: !secret wifi_password2
   ap:
     ssid: ESPHome AP
-    password: !secret wifi_password
+    password: !secret wifi_password2
 
 captive_portal:
 
@@ -59,7 +61,7 @@ logger:
 time:
   - platform: homeassistant
     id: ha_time
-    
+
 interval:
   - interval: 1s
     then:
@@ -68,6 +70,38 @@ interval:
           if (!id(bs_can_online).has_state() || id(bs_can_online).state != online) {
             id(bs_can_online).publish_state(online);
           }
+      # Climate → CAN target-temp sync. Detects user-initiated target changes
+      # from HA (no dedicated trigger exists on the thermostat platform) and
+      # pushes them onto 0x00B byte 5. Gated on CAN being currently online so
+      # a flash-restored target can't fire a stale command before 0x05B has
+      # updated g_00b_b5 at boot.
+      - if:
+          condition:
+            lambda: |-
+              if (id(g_can_last_ms) == 0) return false;
+              if ((millis() - id(g_can_last_ms)) > 5000) return false;
+              const float tt = id(caravan_climate).target_temperature;
+              if (isnan(tt)) return false;
+              const int target = (int) roundf(tt);
+              if (target < 4 || target > 30) return false;
+              return (uint8_t)target != id(g_00b_b5);
+          then:
+            - canbus.send:
+                can_id: 0x00B
+                use_extended_id: false
+                data: !lambda |-
+                  const uint8_t target = (uint8_t) roundf(id(caravan_climate).target_temperature);
+                  const uint8_t mode_byte = (id(g_heat_control_mode_idx) == 1) ? 108 : 110;
+                  const uint8_t d1 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+                  const uint8_t d2 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+                  return std::vector<uint8_t>{mode_byte, 150, d1, d2, 4,
+                    target, (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
+            - lambda: |-
+                const uint8_t target = (uint8_t) roundf(id(caravan_climate).target_temperature);
+                id(g_00b_b5) = target;
+                // Mirror to sibling display entities so UI updates immediately.
+                id(heating_set_temperature).publish_state((float)target);
+                id(num_heating_set_temperature).publish_state((float)target);
 
 globals:
   - id: g_d1_on
@@ -90,7 +124,7 @@ globals:
     restore_value: no
     initial_value: "0.0"
 
-  - id: power_state 
+  - id: power_state
     type: bool
     restore_value: no
     initial_value: 'false'
@@ -163,6 +197,7 @@ globals:
     restore_value: no
     initial_value: '0'
 
+  # 0..3 (Off / 1kW / 2kW / 3kW). No longer includes Gas — that's now sw_gas.
   - id: g_heat_mode_idx
     type: uint8_t
     restore_value: no
@@ -182,6 +217,32 @@ globals:
     type: uint64_t
     restore_value: no
     initial_value: '0'
+
+  # --- 0x00B shared-frame state (bytes 5..7) ---
+  # byte 5: heating set temperature (°C). Synced from 0x05B byte 4.
+  - id: g_00b_b5
+    type: uint8_t
+    restore_value: no
+    initial_value: '20'
+
+  # byte 7: heating override duration (hours). No known read source,
+  # so we restore the last value we sent across reboots.
+  - id: g_00b_b7
+    type: uint8_t
+    restore_value: yes
+    initial_value: '1'
+
+  # 0=Override (byte 0 = 110), 1=Timer (byte 0 = 108). Synced from 0x087 byte 6.
+  - id: g_heat_control_mode_idx
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  # Gas status (0xAD byte 1). Synced from 0x085 byte 1.
+  - id: g_gas_on
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 canbus:
   - platform: esp32_can
@@ -208,6 +269,16 @@ canbus:
                 id(g_interior_sync) = false;
               }
 
+      # DIAGNOSTIC: log every 0x00B frame on the bus so we can see what the
+      # physical control panel actually sends for hot-water / heating commands.
+      # Note: on some CAN setups this will also echo our own TX frames back.
+      - can_id: 0x00B
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              ESP_LOGW("CAN00B_RX", "0x00B seen: %s",
+                       format_hex_pretty(x.data(), x.size()).c_str());
+
       # - can_id: 0x08F
       #   can_id_mask: 0x7FF
       #   then:
@@ -216,6 +287,7 @@ canbus:
       #                 (unsigned) x.size(),
       #                 format_hex_pretty(x.data(), x.size()).c_str());
 
+      # Alko ATC CAN Block
       - can_id: 0x0D8
         can_id_mask: 0x7FF
         then:
@@ -237,6 +309,7 @@ canbus:
               const uint64_t self_test_active_3     = 0x0000000000008301ULL;
               const uint64_t active                 = 0x0000000000008401ULL;
               const uint64_t in_action              = 0x0000000000009999ULL;
+
               const char *state = "Unknown";
               if (frame == status_not_known) state = "Status not Known";
               else if (frame == waiting_for_self_test) state = "Waiting for Self Test";
@@ -388,6 +461,8 @@ canbus:
                       (int)id(heating_set_temperature).state != (int)temp) {
                     id(heating_set_temperature).publish_state(temp);
                   }
+                  // Keep the 0x00B byte-5 mirror current so light commands don't stomp it.
+                  id(g_00b_b5) = (uint8_t) x[4];
                 }
 
                 {
@@ -472,27 +547,26 @@ canbus:
                 ESP_LOGD("CAN084", "short frame (%u)", (unsigned)x.size());
               }
 
+      # 0x085 — heating electric level and gas state.
+      # Electric level (byte 0: 0..3) and gas (byte 1: 0/1) are now tracked
+      # independently so the user can run gas + electric together.
       - can_id: 0x085
         can_id_mask: 0x7FF
         then:
           - lambda: |-
               if (x.size() >= 2) {
-                uint8_t new_idx = 0;
-                const bool gas_on = x[1] > 0;
-                if (gas_on) {
-                  new_idx = 4;  // Gas
-                } else {
-                  switch (x[0]) {            // first byte
-                    case 1: new_idx = 1; break;  // Electric 1kW
-                    case 2: new_idx = 2; break;  // Electric 2kW
-                    case 3: new_idx = 3; break;  // Electric 3kW
-                    default: new_idx = 0; break; // Off
-                  }
+                uint8_t elec = x[0];
+                if (elec > 3) elec = 0;
+                if (id(g_heat_mode_idx) != elec) {
+                  id(g_heat_mode_idx) = elec;
+                  static const char* opts[] = {"Off","Electric 1kW","Electric 2kW","Electric 3kW"};
+                  id(sel_heating_mode).publish_state(opts[elec]);
                 }
-                if (id(g_heat_mode_idx) != new_idx) {
-                  id(g_heat_mode_idx) = new_idx;
-                  static const char* opts[] = {"Off","Electric 1kW","Electric 2kW","Electric 3kW","Gas"};
-                  id(sel_heating_mode).publish_state(opts[new_idx]);
+
+                const bool gas_on = x[1] > 0;
+                if (id(g_gas_on) != gas_on) {
+                  id(g_gas_on) = gas_on;
+                  id(sw_gas).publish_state(gas_on);
                 }
               } else {
                 ESP_LOGD("CAN085", "short frame (%u)", (unsigned)x.size());
@@ -527,15 +601,19 @@ canbus:
                 id(ts_charging_mode).publish_state(mode_text);
               }
 
+      # 0x087 — heating control mode (Override/Timer).
+      # Byte 6 == 0 → Override (command byte 110), byte 6 != 0 → Timer (command byte 108).
       - can_id: 0x087
         can_id_mask: 0x7FF
         then:
           - lambda: |-
               if (x.size() >= 7) {
                 const bool timer = x[6] > 0;
-                const std::string mode = timer ? "Timer" : "Manual";
-                if (!id(ts_heating_control_mode).has_state() || id(ts_heating_control_mode).state != mode) {
-                  id(ts_heating_control_mode).publish_state(mode);
+                const uint8_t idx = timer ? 1 : 0;
+                if (id(g_heat_control_mode_idx) != idx) {
+                  id(g_heat_control_mode_idx) = idx;
+                  static const char* opts[] = {"Override","Timer"};
+                  id(sel_heating_control_mode).publish_state(opts[idx]);
                 }
               } else {
                 ESP_LOGD("CAN087", "short frame (%u)", (unsigned)x.size());
@@ -549,7 +627,7 @@ binary_sensor:
     id: bs_pump
     name: "Pump"
     icon: mdi:water-pump
-    
+
   - platform: template
     id: bs_power
     name: "Power"
@@ -628,7 +706,8 @@ binary_sensor:
     name: "Heating"
     icon: mdi:radiator
     lambda: |-
-      return id(sel_heating_mode).current_option() != "Off";
+      // Electric level selected OR gas lit.
+      return (id(sel_heating_mode).current_option() != "Off") || id(g_gas_on);
     on_press:
       then:
         - climate.control:
@@ -646,7 +725,7 @@ binary_sensor:
     icon: mdi:water-boiler
     lambda: |-
       return id(sel_hot_water_mode).current_option() != "Off";
-      
+
 text_sensor:
   - platform: wifi_info
     ip_address:
@@ -695,11 +774,9 @@ text_sensor:
     icon: mdi:car-battery
     update_interval: never
 
-  - platform: template
-    id: ts_heating_control_mode
-    name: "Heating Control Mode"
-    icon: mdi:timer-cog
-    update_interval: never
+  # ts_heating_control_mode removed — replaced by writable sel_heating_control_mode.
+  # If any HA automations referenced it, repoint them at select.heating_control_mode.
+  # Note: state labels changed from "Manual"/"Timer" to "Override"/"Timer".
 
   - platform: template
     id: ts_alko_atc_status
@@ -921,6 +998,50 @@ sensor:
           window_size: 5
           send_every: 1
 
+number:
+  # Writable heating set-temperature. Reads g_00b_b5 (kept in sync from 0x05B).
+  # When the user sets it we send a 0x00B frame with byte 0 = current mode
+  # (108 Timer / 110 Override) and preserve bytes 2..4, 6, 7.
+  - platform: template
+    id: num_heating_set_temperature
+    name: "Heating Target Temperature"
+    icon: mdi:thermometer
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 4
+    max_value: 30
+    step: 1
+    update_interval: 10s
+    lambda: |-
+      return (float) id(g_00b_b5);
+    set_action:
+      - canbus.send:
+          can_id: 0x00B
+          use_extended_id: false
+          data: !lambda |-
+            const uint8_t temp = (uint8_t) roundf(fmaxf(4.0f, fminf(30.0f, x)));
+            const uint8_t mode_byte = (id(g_heat_control_mode_idx) == 1) ? 108 : 110;
+            const uint8_t d1 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+            const uint8_t d2 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+            return std::vector<uint8_t>{
+              mode_byte, 150, d1, d2, 4,
+              temp,
+              (uint8_t) id(g_hot_water_mode_idx),
+              id(g_00b_b7)
+            };
+      - lambda: |-
+          const float clamped = fmaxf(4.0f, fminf(30.0f, x));
+          const uint8_t temp = (uint8_t) roundf(clamped);
+          id(g_00b_b5) = temp;
+          // Mirror immediately so the UI doesn't wait ~30s for the next 0x05B.
+          id(num_heating_set_temperature).publish_state((float)temp);
+          id(heating_set_temperature).publish_state((float)temp);
+          // Keep the climate entity's target in sync so the interval-based
+          // sync doesn't immediately re-fire.
+          auto call = id(caravan_climate).make_call();
+          call.set_target_temperature((float)temp);
+          call.perform();
+
 output:
   - platform: template
     id: dimmer1_tx_out
@@ -940,7 +1061,8 @@ output:
                 data: !lambda |-
                   const uint8_t d1 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, state * 100.0f)));
                   const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
-                  return std::vector<uint8_t>{1, 150, d1, d2_cur, 4, 0, 0, 0};
+                  return std::vector<uint8_t>{1, 150, d1, d2_cur, 4,
+                    id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
 
   - platform: template
     id: dimmer2_tx_out
@@ -960,7 +1082,8 @@ output:
                 data: !lambda |-
                   const uint8_t d2 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, state * 100.0f)));
                   const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
-                  return std::vector<uint8_t>{1, 150, d1_cur, d2, 4, 0, 0, 0};
+                  return std::vector<uint8_t>{1, 150, d1_cur, d2, 4,
+                    id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
 
   - platform: template
     id: interior_lights_tx_out
@@ -969,7 +1092,7 @@ output:
       - if:
           condition:
             lambda: |-
-              const bool syncing = id(g_interior_sync); 
+              const bool syncing = id(g_interior_sync);
               const bool want_on = state;
               const bool is_on   = id(g_032_b2) > 0;
               return (!syncing) && (want_on != is_on);
@@ -980,7 +1103,8 @@ output:
                 data: !lambda |-
                   const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
                   const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
-                  return std::vector<uint8_t>{5, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+                  return std::vector<uint8_t>{5, 150, d1_cur, d2_cur, 4,
+                    id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
 
   - platform: template
     id: awning_light_tx_out
@@ -1000,7 +1124,8 @@ output:
                 data: !lambda |-
                   const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
                   const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
-                  return std::vector<uint8_t>{6, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+                  return std::vector<uint8_t>{6, 150, d1_cur, d2_cur, 4,
+                    id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
 
   - platform: template
     id: entry_light_tx_out
@@ -1020,7 +1145,8 @@ output:
                 data: !lambda |-
                   const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
                   const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
-                  return std::vector<uint8_t>{8, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+                  return std::vector<uint8_t>{8, 150, d1_cur, d2_cur, 4,
+                    id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
 
   - platform: ledc
     pin: 16
@@ -1058,7 +1184,8 @@ light:
                 data: !lambda |-
                   const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
                   const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
-                  return std::vector<uint8_t>{9, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+                  return std::vector<uint8_t>{9, 150, d1_cur, d2_cur, 4,
+                    id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
       - lambda: |-
           id(g_dim1_sync) = false;
     on_turn_off:
@@ -1075,7 +1202,8 @@ light:
                 data: !lambda |-
                   const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
                   const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
-                  return std::vector<uint8_t>{9, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+                  return std::vector<uint8_t>{9, 150, d1_cur, d2_cur, 4,
+                    id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
       - lambda: |-
           id(g_dim1_sync) = false;
 
@@ -1099,8 +1227,8 @@ light:
                 data: !lambda |-
                   const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
                   const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
-                  return std::vector<uint8_t>{10, 150, d1_cur, d2_cur, 4, 0, 0, 0};
-
+                  return std::vector<uint8_t>{10, 150, d1_cur, d2_cur, 4,
+                    id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
       - lambda: |-
           id(g_dim2_sync) = false;
     on_turn_off:
@@ -1117,7 +1245,8 @@ light:
                 data: !lambda |-
                   const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
                   const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
-                  return std::vector<uint8_t>{10, 150, d1_cur, d2_cur, 4, 0, 0, 0};
+                  return std::vector<uint8_t>{10, 150, d1_cur, d2_cur, 4,
+                    id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
       - lambda: |-
           id(g_dim2_sync) = false;
 
@@ -1133,7 +1262,7 @@ light:
     icon: mdi:wall-sconce-flat
     id: awning_light
     output: awning_light_tx_out
-    restore_mode: RESTORE_DEFAULT_OFF 
+    restore_mode: RESTORE_DEFAULT_OFF
 
   - platform: binary
     name: "Entry Light"
@@ -1147,18 +1276,52 @@ light:
     icon: mdi:lightbulb
     id: floor_lights
     output: floor_lights_output
-    gamma_correct: 1.0  
-    restore_mode: RESTORE_DEFAULT_OFF 
+    gamma_correct: 1.0
+    restore_mode: RESTORE_DEFAULT_OFF
 
   - platform: monochromatic
     name: "Pelmet Lights"
     icon: mdi:lightbulb
     id: pelmet_lights
     output: pelmet_lights_output
-    gamma_correct: 1.0  
-    restore_mode: RESTORE_DEFAULT_OFF 
+    gamma_correct: 1.0
+    restore_mode: RESTORE_DEFAULT_OFF
+
+switch:
+  # Gas burner on/off. Sent via 0x0AD byte 1; byte 0 keeps the current electric level.
+  # Fixed trailing bytes (1,0,1,1,0,0) match the observed static payload.
+  - platform: template
+    id: sw_gas
+    name: "Gas Heating"
+    icon: mdi:fire
+    lambda: |-
+      return id(g_gas_on);
+    turn_on_action:
+      - canbus.send:
+          can_id: 0x0AD
+          use_extended_id: false
+          data: !lambda |-
+            uint8_t level = id(g_heat_mode_idx);
+            if (level > 3) level = 0;
+            return std::vector<uint8_t>{level, 1, 1, 0, 1, 1, 0, 0};
+      - lambda: |-
+          id(g_gas_on) = true;
+          id(sw_gas).publish_state(true);
+    turn_off_action:
+      - canbus.send:
+          can_id: 0x0AD
+          use_extended_id: false
+          data: !lambda |-
+            uint8_t level = id(g_heat_mode_idx);
+            if (level > 3) level = 0;
+            return std::vector<uint8_t>{level, 0, 1, 0, 1, 1, 0, 0};
+      - lambda: |-
+          id(g_gas_on) = false;
+          id(sw_gas).publish_state(false);
 
 select:
+  # Electric heating level. Gas is now a separate switch (sw_gas).
+  # Writes 0x0AD byte 0; byte 1 preserves current gas state.
   - platform: template
     id: sel_heating_mode
     name: "Heating Mode"
@@ -1168,16 +1331,30 @@ select:
       - "Electric 1kW"
       - "Electric 2kW"
       - "Electric 3kW"
-      - "Gas"
     lambda: |-
-      static const char* opts[] = {"Off","Electric 1kW","Electric 2kW","Electric 3kW","Gas"};
-      return std::string(opts[id(g_heat_mode_idx)]);
+      static const char* opts[] = {"Off","Electric 1kW","Electric 2kW","Electric 3kW"};
+      uint8_t i = id(g_heat_mode_idx);
+      if (i > 3) i = 0;
+      return std::string(opts[i]);
     set_action:
+      - canbus.send:
+          can_id: 0x0AD
+          use_extended_id: false
+          data: !lambda |-
+            uint8_t level = 0;
+            if (x == "Electric 1kW") level = 1;
+            else if (x == "Electric 2kW") level = 2;
+            else if (x == "Electric 3kW") level = 3;
+            const uint8_t gas = id(g_gas_on) ? 1 : 0;
+            return std::vector<uint8_t>{level, gas, 1, 0, 1, 1, 0, 0};
       - lambda: |-
-          static const char* opts[] = {"Off","Electric 1kW","Electric 2kW","Electric 3kW","Gas"};
-          ESP_LOGI("HEAT", "Heating Mode is read-only; ignoring user change to: %s", x.c_str());
-          id(sel_heating_mode).publish_state(opts[id(g_heat_mode_idx)]);
+          if (x == "Electric 1kW") id(g_heat_mode_idx) = 1;
+          else if (x == "Electric 2kW") id(g_heat_mode_idx) = 2;
+          else if (x == "Electric 3kW") id(g_heat_mode_idx) = 3;
+          else id(g_heat_mode_idx) = 0;
+          id(sel_heating_mode).publish_state(x);
 
+  # Hot water mode. Writes 0x00B byte 6; other bytes preserved from current state.
   - platform: template
     id: sel_hot_water_mode
     name: "Hot Water Mode"
@@ -1188,12 +1365,108 @@ select:
       - "Boost"
     lambda: |-
       static const char* opts[] = {"Off","Normal","Boost"};
-      return std::string(opts[id(g_hot_water_mode_idx)]);
+      uint8_t i = id(g_hot_water_mode_idx);
+      if (i > 2) i = 0;
+      return std::string(opts[i]);
     set_action:
+      - canbus.send:
+          can_id: 0x00B
+          use_extended_id: false
+          data: !lambda |-
+            uint8_t hw = 0;
+            if (x == "Normal") hw = 1;
+            else if (x == "Boost") hw = 2;
+            // Observed from the control panel: byte 0 is 0x6E (110) only when
+            // we're turning HW OFF while heating is still running. 0x6C (108)
+            // is used for HW on, and for "everything off". The g_heat_control_mode_idx
+            // based mapping was wrong for this specific frame type — the write side
+            // doesn't cleanly map to Override/Timer the way the spec implied.
+            const uint8_t cur_temp = id(g_00b_b5);
+            const uint8_t mode_byte = (hw == 0 && cur_temp > 0) ? 110 : 108;
+            const uint8_t d1 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+            const uint8_t d2 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+            std::vector<uint8_t> frame = {mode_byte, 150, d1, d2, 4,
+              cur_temp, hw, id(g_00b_b7)};
+            // DIAGNOSTIC: log what we're sending so we can compare against what
+            // the physical panel sends for the same user action.
+            ESP_LOGW("CAN00B_TX", "HW '%s' -> %s",
+                     x.c_str(),
+                     format_hex_pretty(frame.data(), frame.size()).c_str());
+            return frame;
       - lambda: |-
-          static const char* opts[] = {"Off","Normal","Boost"};
-          ESP_LOGI("HW", "Hot Water Mode is read-only; ignoring user change to: %s", x.c_str());
-          id(sel_hot_water_mode).publish_state(opts[id(g_hot_water_mode_idx)]);
+          if (x == "Normal") id(g_hot_water_mode_idx) = 1;
+          else if (x == "Boost") id(g_hot_water_mode_idx) = 2;
+          else id(g_hot_water_mode_idx) = 0;
+          id(sel_hot_water_mode).publish_state(x);
+
+  # Override vs Timer — controls 0x00B byte 0 (110 = Override, 108 = Timer).
+  # Synced from 0x087 byte 6.
+  - platform: template
+    id: sel_heating_control_mode
+    name: "Heating Control Mode"
+    icon: mdi:timer-cog
+    options:
+      - "Override"
+      - "Timer"
+    lambda: |-
+      static const char* opts[] = {"Override","Timer"};
+      uint8_t i = id(g_heat_control_mode_idx);
+      if (i > 1) i = 0;
+      return std::string(opts[i]);
+    set_action:
+      - canbus.send:
+          can_id: 0x00B
+          use_extended_id: false
+          data: !lambda |-
+            const uint8_t mode_byte = (x == "Timer") ? 108 : 110;
+            const uint8_t d1 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+            const uint8_t d2 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+            return std::vector<uint8_t>{mode_byte, 150, d1, d2, 4,
+              id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
+      - lambda: |-
+          id(g_heat_control_mode_idx) = (x == "Timer") ? 1 : 0;
+          id(sel_heating_control_mode).publish_state(x);
+
+  # Override duration. Writes 0x00B byte 7.
+  - platform: template
+    id: sel_override_hours
+    name: "Heating Override Hours"
+    icon: mdi:timer-sand
+    options:
+      - "1h"
+      - "2h"
+      - "4h"
+      - "8h"
+      - "12h"
+    lambda: |-
+      uint8_t h = id(g_00b_b7);
+      if (h <= 1) return std::string("1h");
+      if (h <= 2) return std::string("2h");
+      if (h <= 4) return std::string("4h");
+      if (h <= 8) return std::string("8h");
+      return std::string("12h");
+    set_action:
+      - canbus.send:
+          can_id: 0x00B
+          use_extended_id: false
+          data: !lambda |-
+            uint8_t h = 1;
+            if (x == "2h") h = 2;
+            else if (x == "4h") h = 4;
+            else if (x == "8h") h = 8;
+            else if (x == "12h") h = 12;
+            const uint8_t mode_byte = (id(g_heat_control_mode_idx) == 1) ? 108 : 110;
+            const uint8_t d1 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
+            const uint8_t d2 = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
+            return std::vector<uint8_t>{mode_byte, 150, d1, d2, 4,
+              id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), h};
+      - lambda: |-
+          if (x == "2h") id(g_00b_b7) = 2;
+          else if (x == "4h") id(g_00b_b7) = 4;
+          else if (x == "8h") id(g_00b_b7) = 8;
+          else if (x == "12h") id(g_00b_b7) = 12;
+          else id(g_00b_b7) = 1;
+          id(sel_override_hours).publish_state(x);
 
 climate:
   - platform: thermostat
@@ -1204,9 +1477,46 @@ climate:
     min_heating_off_time: 1s
     min_heating_run_time: 1s
     idle_action:
-      - logger.log: "Climate idle (read-only)"
+      - logger.log: "Climate idle (caravan runs its own thermostat; ESP is a passthrough)"
     heat_action:
-      - logger.log: "Climate heat (read-only)"
+      - logger.log: "Climate heat (caravan runs its own thermostat; ESP is a passthrough)"
+    # Mode triggers — turn heating off/on via 0x0AD.
+    # Guards make the triggers idempotent so the on_boot sync call and repeat
+    # mode-toggles don't re-send commands against already-matching state.
+    off_mode:
+      - if:
+          condition:
+            lambda: |-
+              return id(g_heat_mode_idx) != 0 || id(g_gas_on);
+          then:
+            - logger.log: "Climate OFF: disabling electric + gas"
+            - canbus.send:
+                can_id: 0x0AD
+                use_extended_id: false
+                data: !lambda |-
+                  return std::vector<uint8_t>{0, 0, 1, 0, 1, 1, 0, 0};
+            - lambda: |-
+                id(g_heat_mode_idx) = 0;
+                id(g_gas_on) = false;
+                id(sel_heating_mode).publish_state("Off");
+                id(sw_gas).publish_state(false);
+    heat_mode:
+      - if:
+          condition:
+            lambda: |-
+              // Only kick things on if nothing is currently running — otherwise
+              // respect whatever the user already has selected (gas, 2kW, etc.).
+              return id(g_heat_mode_idx) == 0 && !id(g_gas_on);
+          then:
+            - logger.log: "Climate HEAT: nothing on, defaulting to Electric 1kW"
+            - canbus.send:
+                can_id: 0x0AD
+                use_extended_id: false
+                data: !lambda |-
+                  return std::vector<uint8_t>{1, 0, 1, 0, 1, 1, 0, 0};
+            - lambda: |-
+                id(g_heat_mode_idx) = 1;
+                id(sel_heating_mode).publish_state("Electric 1kW");
     preset:
       - name: "Default"
         default_target_temperature_low: 19 °C
