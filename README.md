@@ -29,12 +29,13 @@ Modern Swift/Sterling caravans use a CAN bus network to connect the control pane
 - Floor and pelmet LED strips (PWM via LEDC, 10 kHz)
 - Feedback-loop prevention so local panel and Home Assistant stay in sync
 
-### Heating (Alde) - CURRENTLY READ ONLY
+### Heating (Alde)
 - Thermostat entity with Heat / Off modes
 - Default preset 19 °C, storage preset 10 °C, range 4–30 °C
-- Heating mode read-out: Off / Electric 1 kW / 2 kW / 3 kW / Gas
-- Hot water mode read-out: Off / Normal / Boost
-- Timer vs manual control mode indicator
+- Electric heating mode: Off / 1 kW / 2 kW / 3 kW
+- Gas heating mode
+- Hot water modes: Off / Normal / Boost
+- Timer vs manual vs override control modes
 - Error flags for heating and hot water faults
 
 ### Power & battery monitoring
@@ -91,14 +92,15 @@ Modern Swift/Sterling caravans use a CAN bus network to connect the control pane
 | `0x086` | Solar charge destination and charging mode |
 | `0x087` | Timer vs manual heating control |
 | `0x0D8` | Alko ATC trailer control status |
+| `0x008` | Controls for heating and lights |
 
 ## Home Assistant Integration
 
 All entities are exposed over the encrypted ESPHome API. Once adopted in Home Assistant you get:
 
 - Light entities for every lighting circuit (with dimmer support)
-- Climate entity for the Alde heating system (READ ONLY)
-- Select entities for heating and hot water mode read-outs (READ ONLY)
+- Climate entity for the Alde heating system
+- Select entities for heating and hot water modes
 - Sensor entities for every voltage, current, power, temperature, and status value
 - Binary sensor entities for all warning and status flags
 
