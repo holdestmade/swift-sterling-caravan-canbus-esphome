@@ -102,28 +102,6 @@ interval:
                 // Mirror to sibling display entities so UI updates immediately.
                 id(heating_set_temperature).publish_state((float)target);
                 id(num_heating_set_temperature).publish_state((float)target);
-      # Interior light "master enable" watchdog.
-      # Some caravan lighting circuits only function while the interior master is on.
-      # If CAN is online and 0x032 reports interior OFF, retry an ON command every 5s.
-      - if:
-          condition:
-            lambda: |-
-              if (id(g_can_last_ms) == 0) return false;
-              if ((millis() - id(g_can_last_ms)) > 5000) return false;
-              if ((millis() - id(g_interior_last_force_ms)) < 5000) return false;
-              return id(g_032_b2) == 0;
-          then:
-            - canbus.send:
-                can_id: 0x00B
-                use_extended_id: false
-                data: !lambda |-
-                  const uint8_t d1_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d1_level) * 100.0f)));
-                  const uint8_t d2_cur = (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, id(g_d2_level) * 100.0f)));
-                  return std::vector<uint8_t>{5, 150, d1_cur, d2_cur, 4,
-                    id(g_00b_b5), (uint8_t) id(g_hot_water_mode_idx), id(g_00b_b7)};
-            - lambda: |-
-                id(g_interior_last_force_ms) = millis();
-                ESP_LOGD("INT_WATCHDOG", "Interior master reported OFF; sent ON keepalive");
 
 globals:
   - id: g_d1_on
@@ -219,11 +197,6 @@ globals:
     restore_value: no
     initial_value: '0'
 
-  - id: g_interior_last_force_ms
-    type: uint32_t
-    restore_value: no
-    initial_value: '0'
-
   # 0..3 (Off / 1kW / 2kW / 3kW). No longer includes Gas — that's now sw_gas.
   - id: g_heat_mode_idx
     type: uint8_t
@@ -288,15 +261,38 @@ canbus:
               id(g_can_last_ms) = millis();
               id(g_can_frame_counter)++;
 
-      # DIAGNOSTIC: log every 0x00B frame on the bus so we can see what the
+              if (!id(interior_lights).current_values.is_on()) {
+                id(g_interior_sync) = true;
+                auto call = id(interior_lights).turn_on();
+                call.set_transition_length(0);
+                call.perform();
+                id(g_interior_sync) = false;
+              }
+
+      # DIAGNOSTIC: log every 0x00B, 0x0AD and 0x0AF frames on the bus so we can see what the
       # physical control panel actually sends for hot-water / heating commands.
       # Note: on some CAN setups this will also echo our own TX frames back.
       - can_id: 0x00B
         can_id_mask: 0x7FF
         then:
           - lambda: |-
-              ESP_LOGW("CAN00B_RX", "0x00B seen: %s",
+              ESP_LOGW("CAN00B_RX", "0x00B (11) seen: %s",
                        format_hex_pretty(x.data(), x.size()).c_str());
+
+      - can_id: 0x0AD
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              ESP_LOGW("CAN0AD_RX", "0x0AD (173) seen: %s",
+                       format_hex_pretty(x.data(), x.size()).c_str());
+
+      - can_id: 0x0AF
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              ESP_LOGW("CAN0AF_RX", "0x0AF (175) seen: %s",
+                       format_hex_pretty(x.data(), x.size()).c_str());
+
 
       # - can_id: 0x08F
       #   can_id_mask: 0x7FF
