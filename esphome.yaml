@@ -443,6 +443,25 @@ canbus:
                 ESP_LOGD("CAN033", "short frame (%u)", (unsigned)x.size());
               }
 
+      - can_id: 0x04E
+        can_id_mask: 0x7FF
+        then:
+          - lambda: |-
+              if (x.empty()) return;
+              auto pub_num = [](esphome::template_::TemplateSensor* s, float v, float eps=0.01f) {
+                if (!s->has_state() || isnan(s->state) || fabsf(s->state - v) >= eps) s->publish_state(v);
+              };
+              if (x[0] == 240 && x.size() >= 8) {
+                pub_num(id(solar_charging_current), x[3] / 100.0f, 0.01f);
+                pub_num(id(solar_charging_mode), (float)x[5], 0.5f);
+              } else if (x[0] == 241 && x.size() >= 6) {
+                pub_num(id(solar_panel_voltage),          x[1] / 10.0f, 0.05f);
+                pub_num(id(solar_mppt_charging_mode),     (float)x[2], 0.5f);
+                pub_num(id(solar_charger_output_voltage), x[3] / 10.0f, 0.05f);
+              } else {
+                ESP_LOGD("CAN04E", "unexpected frame b0=%u size=%u", (unsigned)x[0], (unsigned)x.size());
+              }
+
       - can_id: 0x05A
         can_id_mask: 0x7FF
         then:
@@ -970,6 +989,60 @@ sensor:
     filters:
       - throttle: 10s
       - delta: 0.1
+
+  - platform: template
+    id: solar_charging_current
+    name: "Solar Charging Current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.01
+
+  - platform: template
+    id: solar_panel_voltage
+    name: "Solar Panel Output Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.1
+
+  - platform: template
+    id: solar_charger_output_voltage
+    name: "Solar Charger Output Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 10s
+      - delta: 0.1
+
+  - platform: template
+    id: solar_charging_mode
+    name: "Solar Charging Mode"
+    icon: mdi:solar-power-variant
+    accuracy_decimals: 0
+    update_interval: never
+    filters:
+      - throttle: 1s
+
+  - platform: template
+    id: solar_mppt_charging_mode
+    name: "Solar MPPT Charging Mode"
+    icon: mdi:solar-power-variant
+    accuracy_decimals: 0
+    update_interval: never
+    filters:
+      - throttle: 1s
 
   - platform: template
     id: ac_current
