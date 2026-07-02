@@ -35,7 +35,7 @@ Modern Swift/Sterling caravans use a CAN bus network to connect the control pane
 - Electric heating mode: Off / 1 kW / 2 kW / 3 kW
 - Gas heating mode
 - Hot water modes: Off / Normal / Boost
-- Timer vs manual vs override control modes
+- Override vs Timer control modes, with override duration (1–12 h)
 - Error flags for heating and hot water faults
 
 ### Power & battery monitoring
@@ -84,15 +84,17 @@ Modern Swift/Sterling caravans use a CAN bus network to connect the control pane
 |----------|----------|
 | `0x032` | Pump, battery selection, engine, mains, interior/awning lights |
 | `0x033` | Dimmer levels, solar source and charging status |
+| `0x04E` | Solar charger detail (charging current, panel/output voltage, MPPT mode) |
 | `0x05A` | Warning flags (frost, voltage, mains, AC overcurrent) |
 | `0x05B` | Heating/hot water modes, software versions, fault flags |
 | `0x083` | Internal/external temperature, PSU software number |
 | `0x084` | Battery voltages, currents, humidity, entry light |
-| `0x085` | Heating mode selection |
+| `0x085` | Heating electric level and gas state |
 | `0x086` | Solar charge destination and charging mode |
-| `0x087` | Timer vs manual heating control |
+| `0x087` | Override vs Timer heating control mode |
 | `0x0D8` | Alko ATC trailer control status |
-| `0x008` | Controls for heating and lights |
+| `0x00B` | Commands: lights, dimmers, set temperature, hot water, control mode |
+| `0x0AD` | Commands: heating electric level and gas on/off |
 
 ## Home Assistant Integration
 
@@ -112,9 +114,11 @@ Secrets are stored in a separate `secrets.yaml` file (not included). You need to
 
 ```yaml
 wifi_ssid: "YourSSID"
-wifi_password: "YourPassword"
-api_encryption_key: "your-32-byte-base64-key"
+wifi_password2: "YourPassword"
+esphome_key: "your-32-byte-base64-key"
 ```
+
+`canbus_helpers.h` (shared C++ helpers for building and deduplicating CAN frames) must sit in the same directory as `esphome.yaml`; it is pulled in via `esphome: includes:`.
 
 ## Wiring Notes
 
