@@ -29,6 +29,7 @@ esp32:
       CONFIG_ESP_PHY_REDUCE_TX_POWER: "y"
     advanced:
       minimum_chip_revision: '3.1'
+      sram1_as_iram: true
 
 wifi:
   networks:
@@ -230,7 +231,9 @@ canbus:
   - platform: esp32_can
     id: caravan_can
     rx_pin: GPIO4
-    tx_pin: GPIO5
+    tx_pin:
+      number: GPIO5
+      ignore_strapping_warning: true
     bit_rate: 125kbps
     can_id: 0x000
     use_extended_id: false
