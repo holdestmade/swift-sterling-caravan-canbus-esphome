@@ -15,6 +15,40 @@ namespace caravan {
 constexpr uint8_t B00B_CONST1 = 150;
 constexpr uint8_t B00B_CONST4 = 4;
 
+// 0x00B byte 0 values for heating-related commands.
+constexpr uint8_t B00B_CMD_TIMER = 108;     // 0x6C
+constexpr uint8_t B00B_CMD_OVERRIDE = 110;  // 0x6E
+
+// Byte 0 for a heating command in the currently selected control mode
+// (0 = Override, 1 = Timer).
+inline uint8_t control_mode_byte(uint8_t control_mode_idx) {
+  return control_mode_idx == 1 ? B00B_CMD_TIMER : B00B_CMD_OVERRIDE;
+}
+
+// Select option -> wire value mappings, shared between each select's
+// canbus.send data lambda and its state-update lambda so the frame and the
+// cached index can't diverge.
+inline uint8_t electric_level_index(const std::string &s) {
+  if (s == "Electric 1kW") return 1;
+  if (s == "Electric 2kW") return 2;
+  if (s == "Electric 3kW") return 3;
+  return 0;
+}
+
+inline uint8_t hot_water_index(const std::string &s) {
+  if (s == "Normal") return 1;
+  if (s == "Boost") return 2;
+  return 0;
+}
+
+inline uint8_t override_hours(const std::string &s) {
+  if (s == "2h") return 2;
+  if (s == "4h") return 4;
+  if (s == "8h") return 8;
+  if (s == "12h") return 12;
+  return 1;
+}
+
 // Convert a 0.0–1.0 light level to a clamped 0–100 percentage byte.
 inline uint8_t pct(float level) {
   return (uint8_t) roundf(fmaxf(0.0f, fminf(100.0f, level * 100.0f)));
