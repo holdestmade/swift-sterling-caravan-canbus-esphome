@@ -7,17 +7,21 @@ esphome:
   on_boot:
     priority: -90
     then:
+      # Gate on the 0x085 sync flag, not sel_heating_mode.has_state(): the
+      # template select's polled lambda publishes its default option before any
+      # CAN frame arrives, and conversely never publishes at all if the synced
+      # value equals the default — so has_state() proves nothing about sync.
       - wait_until:
           condition:
-            lambda: 'return id(sel_heating_mode).has_state();'
+            lambda: 'return id(g_085_synced);'
           timeout: 5s
       - lambda: |-
-          if (!id(sel_heating_mode).has_state()) {
-            ESP_LOGW("BOOT", "Heating mode not received from CAN within 5s — climate state may be stale");
+          if (!id(g_085_synced)) {
+            ESP_LOGW("BOOT", "Heating state (0x085) not received from CAN within 5s — climate mode left as restored");
             return;
           }
           // Consider heating "on" if any electric level is selected OR gas is lit.
-          const bool any_heat = (id(sel_heating_mode).current_option() != "Off") || id(g_gas_on);
+          const bool any_heat = id(g_heat_mode_idx) != 0 || id(g_gas_on);
           auto call = id(caravan_climate).make_call();
           call.set_mode(any_heat ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_OFF);
           call.perform();
@@ -66,6 +70,18 @@ interval:
           if (!id(bs_can_online).has_state() || id(bs_can_online).state != online) {
             id(bs_can_online).publish_state(online);
           }
+
+          // Interior master watchdog: only force the HA entity back on while
+          // the bus agrees the master is on (0x032 byte 2), so it doesn't
+          // fight the 0x032 off-sync when the panel turns it off. Checked
+          // here once a second rather than in the every-frame handler.
+          if (online && id(g_032_b2) > 0 && !id(interior_lights).current_values.is_on()) {
+            id(g_interior_sync) = true;
+            auto call = id(interior_lights).turn_on();
+            call.set_transition_length(0);
+            call.perform();
+            id(g_interior_sync) = false;
+          }
       # Climate → CAN target-temp sync. Detects user-initiated target changes
       # from HA (no dedicated trigger exists on the thermostat platform) and
       # pushes them onto 0x00B byte 5. Gated on CAN being currently online so
@@ -88,7 +104,7 @@ interval:
                 use_extended_id: false
                 data: !lambda |-
                   const uint8_t target = (uint8_t) roundf(id(caravan_climate).target_temperature);
-                  const uint8_t mode_byte = (id(g_heat_control_mode_idx) == 1) ? 108 : 110;
+                  const uint8_t mode_byte = caravan::control_mode_byte(id(g_heat_control_mode_idx));
                   return caravan::make_00b(mode_byte, id(g_d1_level), id(g_d2_level),
                     target, id(g_hot_water_mode_idx), id(g_00b_b7));
             - lambda: |-
@@ -246,17 +262,6 @@ canbus:
               id(g_can_last_ms) = millis();
               id(g_can_frame_counter)++;
 
-              // Interior master watchdog: only force the HA entity back on
-              // while the bus agrees the master is on (0x032 byte 2), so it
-              // doesn't fight the 0x032 off-sync when the panel turns it off.
-              if (id(g_032_b2) > 0 && !id(interior_lights).current_values.is_on()) {
-                id(g_interior_sync) = true;
-                auto call = id(interior_lights).turn_on();
-                call.set_transition_length(0);
-                call.perform();
-                id(g_interior_sync) = false;
-              }
-
       # Alko ATC CAN Block
       - can_id: 0x0D8
         can_id_mask: 0x7FF
@@ -368,6 +373,30 @@ canbus:
                   id(g_dim2_sync) = false;
                 }
 
+                // Panel-side brightness changes: mirror the bus level into the
+                // HA lights so the sliders track dimming done at the control
+                // panel. g_d?_level is already updated above, so the output
+                // write_action sees pct(state) == pct(level) and won't echo
+                // the frame back onto the bus.
+                if (d1_on && id(dimmer1_light).current_values.is_on() &&
+                    caravan::pct(id(dimmer1_light).current_values.get_brightness()) != caravan::pct(d1_lv)) {
+                  id(g_dim1_sync) = true;
+                  auto cb1 = id(dimmer1_light).turn_on();
+                  cb1.set_brightness(d1_lv);
+                  cb1.set_transition_length(0);
+                  cb1.perform();
+                  id(g_dim1_sync) = false;
+                }
+                if (d2_on && id(dimmer2_light).current_values.is_on() &&
+                    caravan::pct(id(dimmer2_light).current_values.get_brightness()) != caravan::pct(d2_lv)) {
+                  id(g_dim2_sync) = true;
+                  auto cb2 = id(dimmer2_light).turn_on();
+                  cb2.set_brightness(d2_lv);
+                  cb2.set_transition_length(0);
+                  cb2.perform();
+                  id(g_dim2_sync) = false;
+                }
+
                 caravan::pub_txt(id(ts_solar_charging_source), x[6] ? "Car" : "Leisure");
                 caravan::pub_bin(id(bs_solar_charging), x[7] > 0);
               } else {
@@ -458,8 +487,12 @@ canbus:
                          format_hex_pretty(x.data(), x.size()).c_str(),
                          raw_ext, raw_int, t_ext, t_int);
 
-                caravan::pub_num(id(temp_external), roundf(t_ext * 10.0f) / 10.0f, 0.1f);
-                caravan::pub_num(id(temp_internal), roundf(t_int * 10.0f) / 10.0f, 0.1f);
+                // Raw 0 (probe absent / not ready) would decode to -273.15 °C;
+                // skip it rather than pollute HA history with absolute zero.
+                if (raw_ext != 0)
+                  caravan::pub_num(id(temp_external), roundf(t_ext * 10.0f) / 10.0f, 0.1f);
+                if (raw_int != 0)
+                  caravan::pub_num(id(temp_internal), roundf(t_int * 10.0f) / 10.0f, 0.1f);
               }
 
               if (x.size() >= 7) {
@@ -653,12 +686,13 @@ binary_sensor:
     name: "Heating"
     icon: mdi:radiator
     lambda: |-
-      // No update until the heating state has synced from CAN (0x085).
-      // Acting on the empty pre-sync option would read as "on" and the
-      // on_press below could spuriously switch the heating on at boot.
-      if (!id(sel_heating_mode).has_state()) return {};
+      // No update until the heating state has synced from CAN (0x085) —
+      // acting on pre-sync defaults could spuriously toggle the heating at
+      // boot. Gate on g_085_synced, not sel_heating_mode.has_state(): the
+      // select's polled lambda publishes its default before sync.
+      if (!id(g_085_synced)) return {};
       // Electric level selected OR gas lit.
-      return (id(sel_heating_mode).current_option() != "Off") || id(g_gas_on);
+      return id(g_heat_mode_idx) != 0 || id(g_gas_on);
     on_press:
       then:
         - climate.control:
@@ -675,8 +709,8 @@ binary_sensor:
     name: "Hot Water"
     icon: mdi:water-boiler
     lambda: |-
-      if (!id(sel_hot_water_mode).has_state()) return {};
-      return id(sel_hot_water_mode).current_option() != "Off";
+      if (!id(g_05b_synced)) return {};
+      return id(g_hot_water_mode_idx) != 0;
 
 text_sensor:
   - platform: wifi_info
@@ -1032,7 +1066,7 @@ number:
                 use_extended_id: false
                 data: !lambda |-
                   const uint8_t temp = (uint8_t) roundf(fmaxf(4.0f, fminf(30.0f, x)));
-                  const uint8_t mode_byte = (id(g_heat_control_mode_idx) == 1) ? 108 : 110;
+                  const uint8_t mode_byte = caravan::control_mode_byte(id(g_heat_control_mode_idx));
                   return caravan::make_00b(mode_byte, id(g_d1_level), id(g_d2_level),
                     temp, id(g_hot_water_mode_idx), id(g_00b_b7));
             - lambda: |-
@@ -1336,16 +1370,9 @@ select:
                 can_id: 0x0AD
                 use_extended_id: false
                 data: !lambda |-
-                  uint8_t level = 0;
-                  if (x == "Electric 1kW") level = 1;
-                  else if (x == "Electric 2kW") level = 2;
-                  else if (x == "Electric 3kW") level = 3;
-                  return caravan::make_0ad(level, id(g_gas_on));
+                  return caravan::make_0ad(caravan::electric_level_index(x), id(g_gas_on));
             - lambda: |-
-                if (x == "Electric 1kW") id(g_heat_mode_idx) = 1;
-                else if (x == "Electric 2kW") id(g_heat_mode_idx) = 2;
-                else if (x == "Electric 3kW") id(g_heat_mode_idx) = 3;
-                else id(g_heat_mode_idx) = 0;
+                id(g_heat_mode_idx) = caravan::electric_level_index(x);
                 id(sel_heating_mode).publish_state(x);
 
   # Hot water mode. Writes 0x00B byte 6; other bytes preserved from current state.
@@ -1371,22 +1398,19 @@ select:
                 can_id: 0x00B
                 use_extended_id: false
                 data: !lambda |-
-                  uint8_t hw = 0;
-                  if (x == "Normal") hw = 1;
-                  else if (x == "Boost") hw = 2;
+                  const uint8_t hw = caravan::hot_water_index(x);
                   // Observed from the control panel: byte 0 is 0x6E (110) only when
                   // we're turning HW OFF while heating is still running. 0x6C (108)
                   // is used for HW on, and for "everything off". The g_heat_control_mode_idx
                   // based mapping was wrong for this specific frame type — the write side
                   // doesn't cleanly map to Override/Timer the way the spec implied.
                   const uint8_t cur_temp = id(g_00b_b5);
-                  const uint8_t mode_byte = (hw == 0 && cur_temp > 0) ? 110 : 108;
+                  const uint8_t mode_byte = (hw == 0 && cur_temp > 0)
+                    ? caravan::B00B_CMD_OVERRIDE : caravan::B00B_CMD_TIMER;
                   return caravan::make_00b(mode_byte, id(g_d1_level), id(g_d2_level),
                     cur_temp, hw, id(g_00b_b7));
             - lambda: |-
-                if (x == "Normal") id(g_hot_water_mode_idx) = 1;
-                else if (x == "Boost") id(g_hot_water_mode_idx) = 2;
-                else id(g_hot_water_mode_idx) = 0;
+                id(g_hot_water_mode_idx) = caravan::hot_water_index(x);
                 id(sel_hot_water_mode).publish_state(x);
 
   # Override vs Timer — controls 0x00B byte 0 (110 = Override, 108 = Timer).
@@ -1412,7 +1436,7 @@ select:
                 can_id: 0x00B
                 use_extended_id: false
                 data: !lambda |-
-                  const uint8_t mode_byte = (x == "Timer") ? 108 : 110;
+                  const uint8_t mode_byte = caravan::control_mode_byte(x == "Timer" ? 1 : 0);
                   return caravan::make_00b(mode_byte, id(g_d1_level), id(g_d2_level),
                     id(g_00b_b5), id(g_hot_water_mode_idx), id(g_00b_b7));
             - lambda: |-
@@ -1446,20 +1470,11 @@ select:
                 can_id: 0x00B
                 use_extended_id: false
                 data: !lambda |-
-                  uint8_t h = 1;
-                  if (x == "2h") h = 2;
-                  else if (x == "4h") h = 4;
-                  else if (x == "8h") h = 8;
-                  else if (x == "12h") h = 12;
-                  const uint8_t mode_byte = (id(g_heat_control_mode_idx) == 1) ? 108 : 110;
+                  const uint8_t mode_byte = caravan::control_mode_byte(id(g_heat_control_mode_idx));
                   return caravan::make_00b(mode_byte, id(g_d1_level), id(g_d2_level),
-                    id(g_00b_b5), id(g_hot_water_mode_idx), h);
+                    id(g_00b_b5), id(g_hot_water_mode_idx), caravan::override_hours(x));
             - lambda: |-
-                if (x == "2h") id(g_00b_b7) = 2;
-                else if (x == "4h") id(g_00b_b7) = 4;
-                else if (x == "8h") id(g_00b_b7) = 8;
-                else if (x == "12h") id(g_00b_b7) = 12;
-                else id(g_00b_b7) = 1;
+                id(g_00b_b7) = caravan::override_hours(x);
                 id(sel_override_hours).publish_state(x);
 
 climate:
