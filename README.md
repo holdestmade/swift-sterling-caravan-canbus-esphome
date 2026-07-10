@@ -30,8 +30,7 @@ Modern Swift/Sterling caravans use a CAN bus network to connect the control pane
 - Feedback-loop prevention so local panel and Home Assistant stay in sync
 
 ### Heating (Alde)
-- Thermostat entity with Heat / Off modes
-- Default preset 19 °C, storage preset 10 °C, range 4–30 °C
+- Set temperature (4–30 °C, the Alde unit runs its own thermostat)
 - Electric heating mode: Off / 1 kW / 2 kW / 3 kW
 - Gas heating mode
 - Hot water modes: Off / Normal / Boost
@@ -101,7 +100,7 @@ Modern Swift/Sterling caravans use a CAN bus network to connect the control pane
 All entities are exposed over the encrypted ESPHome API. Once adopted in Home Assistant you get:
 
 - Light entities for every lighting circuit (with dimmer support)
-- Climate entity for the Alde heating system
+- Number entity for the Alde heating set temperature (the caravan runs its own thermostat)
 - Select entities for heating and hot water modes
 - Sensor entities for every voltage, current, power, temperature, and status value
 - Binary sensor entities for all warning and status flags
