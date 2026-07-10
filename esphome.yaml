@@ -4,27 +4,6 @@ esphome:
   comment: ESP32 and SN65HVD230 CAN Interface
   includes:
     - canbus_helpers.h
-  on_boot:
-    priority: -90
-    then:
-      # Gate on the 0x085 sync flag, not sel_heating_mode.has_state(): the
-      # template select's polled lambda publishes its default option before any
-      # CAN frame arrives, and conversely never publishes at all if the synced
-      # value equals the default — so has_state() proves nothing about sync.
-      - wait_until:
-          condition:
-            lambda: 'return id(g_085_synced);'
-          timeout: 5s
-      - lambda: |-
-          if (!id(g_085_synced)) {
-            ESP_LOGW("BOOT", "Heating state (0x085) not received from CAN within 5s — climate mode left as restored");
-            return;
-          }
-          // Consider heating "on" if any electric level is selected OR gas is lit.
-          const bool any_heat = id(g_heat_mode_idx) != 0 || id(g_gas_on);
-          auto call = id(caravan_climate).make_call();
-          call.set_mode(any_heat ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_OFF);
-          call.perform();
 esp32:
   board: esp32dev
   framework:
@@ -82,37 +61,6 @@ interval:
             call.perform();
             id(g_interior_sync) = false;
           }
-      # Climate → CAN target-temp sync. Detects user-initiated target changes
-      # from HA (no dedicated trigger exists on the thermostat platform) and
-      # pushes them onto 0x00B byte 5. Gated on CAN being currently online so
-      # a flash-restored target can't fire a stale command before 0x05B has
-      # updated g_00b_b5 at boot.
-      - if:
-          condition:
-            lambda: |-
-              if (!id(g_033_synced) || !id(g_05b_synced)) return false;
-              if (id(g_can_last_ms) == 0) return false;
-              if ((millis() - id(g_can_last_ms)) > 5000) return false;
-              const float tt = id(caravan_climate).target_temperature;
-              if (isnan(tt)) return false;
-              const int target = (int) roundf(tt);
-              if (target < 4 || target > 30) return false;
-              return (uint8_t)target != id(g_00b_b5);
-          then:
-            - canbus.send:
-                can_id: 0x00B
-                use_extended_id: false
-                data: !lambda |-
-                  const uint8_t target = (uint8_t) roundf(id(caravan_climate).target_temperature);
-                  const uint8_t mode_byte = caravan::control_mode_byte(id(g_heat_control_mode_idx));
-                  return caravan::make_00b(mode_byte, id(g_d1_level), id(g_d2_level),
-                    target, id(g_hot_water_mode_idx), id(g_00b_b7));
-            - lambda: |-
-                const uint8_t target = (uint8_t) roundf(id(caravan_climate).target_temperature);
-                id(g_00b_b5) = target;
-                // Mirror to sibling display entities so UI updates immediately.
-                id(heating_set_temperature).publish_state((float)target);
-                id(num_heating_set_temperature).publish_state((float)target);
 
 globals:
   - id: g_d1_on
@@ -443,10 +391,6 @@ canbus:
                 caravan::pub_txt(id(ts_ec630_software_version), to_string((int)x[1]));
                 {
                   const float temp = (float)x[4];
-                  if (!id(heating_set_temperature).has_state() ||
-                      (int)id(heating_set_temperature).state != (int)temp) {
-                    id(heating_set_temperature).publish_state(temp);
-                  }
                   if (!id(num_heating_set_temperature).has_state() ||
                       (int)id(num_heating_set_temperature).state != (int)temp) {
                     id(num_heating_set_temperature).publish_state(temp);
@@ -686,23 +630,12 @@ binary_sensor:
     name: "Heating"
     icon: mdi:radiator
     lambda: |-
-      // No update until the heating state has synced from CAN (0x085) —
-      // acting on pre-sync defaults could spuriously toggle the heating at
-      // boot. Gate on g_085_synced, not sel_heating_mode.has_state(): the
+      // No update until the heating state has synced from CAN (0x085).
+      // Gate on g_085_synced, not sel_heating_mode.has_state(): the
       // select's polled lambda publishes its default before sync.
       if (!id(g_085_synced)) return {};
       // Electric level selected OR gas lit.
       return id(g_heat_mode_idx) != 0 || id(g_gas_on);
-    on_press:
-      then:
-        - climate.control:
-            id: caravan_climate
-            mode: HEAT
-    on_release:
-      then:
-        - climate.control:
-            id: caravan_climate
-            mode: "OFF"
 
   - platform: template
     id: bs_hot_water_on
@@ -793,24 +726,6 @@ text_sensor:
 sensor:
   - platform: wifi_signal
     name: WiFi Signal
-
-  - platform: template
-    id: heating_set_temperature
-    name: "Heating Set Temperature"
-    unit_of_measurement: "°C"
-    device_class: temperature
-    state_class: measurement
-    accuracy_decimals: 1
-    update_interval: never
-    filters:
-      - throttle: 1s
-      - delta: 0.1
-    on_value:
-      then:
-        - climate.control:
-            id: caravan_climate
-            target_temperature: !lambda |-
-              return x;
 
   - platform: template
     id: leisure_battery_power
@@ -1075,12 +990,6 @@ number:
                 id(g_00b_b5) = temp;
                 // Mirror immediately so the UI doesn't wait ~30s for the next 0x05B.
                 id(num_heating_set_temperature).publish_state((float)temp);
-                id(heating_set_temperature).publish_state((float)temp);
-                // Keep the climate entity's target in sync so the interval-based
-                // sync doesn't immediately re-fire.
-                auto call = id(caravan_climate).make_call();
-                call.set_target_temperature((float)temp);
-                call.perform();
 
 output:
   - platform: template
@@ -1476,64 +1385,3 @@ select:
             - lambda: |-
                 id(g_00b_b7) = caravan::override_hours(x);
                 id(sel_override_hours).publish_state(x);
-
-climate:
-  - platform: thermostat
-    id: caravan_climate
-    name: "Alde Heating"
-    sensor: temp_internal
-    min_idle_time: 1s
-    min_heating_off_time: 1s
-    min_heating_run_time: 1s
-    idle_action:
-      - logger.log: "Climate idle (caravan runs its own thermostat; ESP is a passthrough)"
-    heat_action:
-      - logger.log: "Climate heat (caravan runs its own thermostat; ESP is a passthrough)"
-    # Mode triggers — turn heating off/on via 0x0AD.
-    # Guards make the triggers idempotent so the on_boot sync call and repeat
-    # mode-toggles don't re-send commands against already-matching state.
-    off_mode:
-      - if:
-          condition:
-            lambda: |-
-              return id(g_085_synced) && (id(g_heat_mode_idx) != 0 || id(g_gas_on));
-          then:
-            - logger.log: "Climate OFF: disabling electric + gas"
-            - canbus.send:
-                can_id: 0x0AD
-                use_extended_id: false
-                data: !lambda 'return caravan::make_0ad(0, false);'
-            - lambda: |-
-                id(g_heat_mode_idx) = 0;
-                id(g_gas_on) = false;
-                id(sel_heating_mode).publish_state("Off");
-                id(sw_gas).publish_state(false);
-    heat_mode:
-      - if:
-          condition:
-            lambda: |-
-              // Only kick things on if nothing is currently running — otherwise
-              // respect whatever the user already has selected (gas, 2kW, etc.).
-              // Never send before the heating state has synced from 0x085.
-              return id(g_085_synced) && id(g_heat_mode_idx) == 0 && !id(g_gas_on);
-          then:
-            - logger.log: "Climate HEAT: nothing on, defaulting to Electric 1kW"
-            - canbus.send:
-                can_id: 0x0AD
-                use_extended_id: false
-                data: !lambda 'return caravan::make_0ad(1, false);'
-            - lambda: |-
-                id(g_heat_mode_idx) = 1;
-                id(sel_heating_mode).publish_state("Electric 1kW");
-    preset:
-      - name: "Default"
-        default_target_temperature_low: 19 °C
-      - name: "Storage"
-        default_target_temperature_low: 10 °C
-    default_preset: "Default"
-    visual:
-      min_temperature: 4 °C
-      max_temperature: 30 °C
-      temperature_step:
-        target_temperature: 1.0
-        current_temperature: 0.1
