@@ -20,6 +20,7 @@ Modern Swift/Sterling caravans use a CAN bus network to connect the control pane
 | CAN bit rate | 125 kbps |
 | PWM output 1 (Floor Lights) | GPIO 16 |
 | PWM output 2 (Pelmet Lights) | GPIO 17 |
+| Status / CAN activity LED | GPIO 2 (onboard LED on most devkits) |
 
 ## Features
 
@@ -70,6 +71,10 @@ Modern Swift/Sterling caravans use a CAN bus network to connect the control pane
 - Frost warning, voltage warning, mains warning, AC overcurrent warning
 - CAN bus online indicator (5-second timeout watchdog)
 - CAN message rate (msg/s)
+- Onboard status LED doubles as a CAN data indicator:
+  - ESPHome warning/error (Wi-Fi or API down): standard status blink patterns
+  - CAN traffic: ~5 Hz flicker
+  - No CAN data for 5 s: solid on
 - Software versions for control panel, EC630, and PSU
 
 ### Alko ATC (trailer stability)

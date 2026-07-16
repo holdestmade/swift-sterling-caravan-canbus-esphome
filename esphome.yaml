@@ -62,6 +62,31 @@ interval:
             id(g_interior_sync) = false;
           }
 
+  # Status / CAN activity LED driver. Priority order:
+  #  1. ESPHome warning/error (WiFi or API down, OTA, ...): the status_led
+  #     light platform overrides the LED with its blink patterns automatically.
+  #  2. CAN traffic: ~5 Hz flicker — the LED toggles on every 100 ms tick in
+  #     which at least one frame arrived, so it visibly tracks bus activity.
+  #  3. CAN silent for 5 s (same rule as bs_can_online): solid on, meaning
+  #     "running fine, but no CAN data".
+  - interval: 100ms
+    then:
+      - lambda: |-
+          static uint32_t last_count = 0;
+          const uint32_t count = id(g_can_frame_counter);
+          const bool traffic = count != last_count;
+          last_count = count;
+
+          if (traffic) {
+            id(status_can_led).toggle().perform();
+            return;
+          }
+
+          const bool online = id(g_can_last_ms) != 0 && (millis() - id(g_can_last_ms)) < 5000;
+          if (!online && !id(status_can_led).current_values.is_on()) {
+            id(status_can_led).turn_on().perform();
+          }
+
 globals:
   - id: g_d1_on
     type: bool
@@ -1099,6 +1124,19 @@ output:
     frequency: 10000 Hz
 
 light:
+  # Onboard LED (GPIO2 on most ESP32 devkits). While ESPHome has a warning or
+  # error the platform blinks its status patterns; otherwise the 100 ms
+  # interval above drives it as a CAN data indicator (flicker = traffic,
+  # solid = no CAN). internal: the interval owns the LED, so exposing it to
+  # HA would just let a user toggle be overwritten within 100 ms.
+  - platform: status_led
+    id: status_can_led
+    internal: true
+    restore_mode: ALWAYS_OFF
+    pin:
+      number: GPIO2
+      ignore_strapping_warning: true
+
   - platform: monochromatic
     gamma_correct: 1.0
     id: dimmer1_light
